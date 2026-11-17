@@ -4,7 +4,8 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const REPO = 'conductor-oss/conductor-cli';
+// FORK ONLY: download binaries from the fork's releases (drop before upstreaming).
+const REPO = 'Sudakatux/conductor-cli';
 const BINARY_NAME = 'conductor';
 
 // Detect platform and architecture
