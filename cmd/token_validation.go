@@ -129,7 +129,7 @@ func validateUserToken(tokenString string) error {
 	}
 
 	if isTokenExpired(expiry, 0) {
-		return fmt.Errorf("your token has expired\nPlease check your authentication settings. Run 'conductor config save' to configure credentials")
+		return fmt.Errorf("your token has expired\nPlease check your authentication settings. Run 'conductor login' to sign in from your browser, or 'conductor config save' to enter credentials")
 	}
 
 	return nil

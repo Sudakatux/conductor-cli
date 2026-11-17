@@ -591,7 +591,7 @@ func parseAPIError(err error, defaultMsg string) error {
 				if message == "" {
 					message = "Authentication failed"
 				}
-				hint := "Please check your authentication settings. Run 'conductor config save' to configure credentials"
+				hint := "Please check your authentication settings. Run 'conductor login' to sign in from your browser, or 'conductor config save' to enter credentials"
 			if envURL := os.Getenv("CONDUCTOR_SERVER_URL"); envURL != "" {
 				hint += fmt.Sprintf("\nNote: Server URL is set via CONDUCTOR_SERVER_URL=%s", envURL)
 			}
