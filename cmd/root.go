@@ -78,10 +78,10 @@ func isEnterpriseServer() bool {
 // localOnlyCommands are the top-level commands that run entirely on the local
 // machine and therefore need no API client (and no server configuration).
 var localOnlyCommands = map[string]bool{
-	"config": true,
-	"login":  true,
-	"server": true,
-	"update": true,
+	"config":     true,
+	"create-app": true,
+	"server":     true,
+	"update":     true,
 }
 
 // isLocalOnlyCommand reports whether cmd belongs to a local-only command tree.
@@ -260,14 +260,14 @@ func effectiveProfile() string {
 	return os.Getenv("CONDUCTOR_PROFILE")
 }
 
-// isSavingConfig reports whether this is `config save` or `login`, which may
+// isSavingConfig reports whether this is `config save` or `create-app`, which may
 // name a profile whose file does not exist yet.
 func isSavingConfig() bool {
 	for i, arg := range os.Args {
 		if arg == "config" && i+1 < len(os.Args) && os.Args[i+1] == "save" {
 			return true
 		}
-		if arg == "login" {
+		if arg == "create-app" {
 			return true
 		}
 	}

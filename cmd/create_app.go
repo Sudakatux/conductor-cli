@@ -27,6 +27,7 @@ import (
 	neturl "net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -49,18 +50,20 @@ var (
 	loginNoBrowser bool
 	loginTimeout   time.Duration
 	loginLaunchpad string
+	createAppName  string
 )
 
-var loginCmd = &cobra.Command{
-	Use:   "login",
-	Short: "Sign in from the browser and save a profile for an Orkes Conductor server",
-	Long: `Sign in to an Orkes Conductor server from your browser and save the access
-key it creates as a CLI profile. No key or secret is typed, pasted or printed.
+var createAppCmd = &cobra.Command{
+	Use:   "create-app",
+	Short: "Create an application access key from the browser and save it as a profile",
+	Long: `Sign in to an Orkes Conductor server from your browser, create (or reuse) an
+application and an access key for it, and save that key as a CLI profile.
+No key or secret is typed, pasted or printed.
 
 The CLI listens on 127.0.0.1 for one request, opens the server's Launch Pad,
-and waits. After you sign in and click Approve, the page creates an access key
-for the application "coding-agent" and hands it to the CLI, which saves
-~/.conductor-cli/config-<profile>.yaml.
+and waits. After you sign in and click Approve, the page finds or creates the
+application (--name, default "default_app"), creates an access key for it and
+hands it to the CLI, which saves ~/.conductor-cli/config-<profile>.yaml.
 
 The browser and the CLI must run on the same computer. Otherwise (SSH, a
 container), open the printed fallback link and use 'conductor config save'.
@@ -69,19 +72,26 @@ Without --server it asks for one, defaulting to Developer Edition
 (https://developer.orkescloud.com). The profile defaults to "developer" for
 Developer Edition, else the first label of the host (acme for
 acme.orkesconductor.com).`,
-	Example: `  # Developer Edition
-  conductor login
+	Example: `  # Developer Edition, application "default_app"
+  conductor create-app
 
   # Another server, saved as profile "acme"
-  conductor login --server https://acme.orkesconductor.com
+  conductor create-app --server https://acme.orkesconductor.com
 
-  # Pick the profile name yourself, then use it
-  conductor login --server https://acme.orkesconductor.com --profile prod
+  # Name the application and the profile yourself, then use it
+  conductor create-app --server https://acme.orkesconductor.com --name billing-agent --profile prod
   conductor --profile prod workflow list`,
 	GroupID: "config",
 	Args:    cobra.NoArgs,
-	RunE:    runLogin,
+	RunE:    runCreateApp,
 }
+
+const defaultAppName = "default_app"
+
+// appNamePattern keeps the name safe in a URL and readable in the UI.
+var appNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$`)
+
+func validAppName(name string) bool { return appNamePattern.MatchString(name) }
 
 // loginTarget is a server resolved from user input: the API base the profile
 // stores and the UI origin the browser opens.
@@ -170,7 +180,7 @@ func loginCallbackHandler(state, uiOrigin string, results chan<- loginResult) ht
 		}
 		got := r.PostForm.Get("state")
 		if subtle.ConstantTimeCompare([]byte(got), []byte(state)) != 1 {
-			writeLoginPage(w, http.StatusForbidden, "Wrong sign-in link", "This link was not opened by this CLI. Run conductor login again.")
+			writeLoginPage(w, http.StatusForbidden, "Wrong sign-in link", "This link was not opened by this CLI. Run conductor create-app again.")
 			return
 		}
 		if e := r.PostForm.Get("error"); e != "" {
@@ -243,7 +253,10 @@ func openBrowser(target string) error {
 
 func stdinIsTerminal() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
 
-func runLogin(cmd *cobra.Command, _ []string) error {
+func runCreateApp(cmd *cobra.Command, _ []string) error {
+	if !validAppName(createAppName) {
+		return fmt.Errorf("invalid --name %q: use 1-64 letters, digits, spaces, _ . or -, starting with a letter or digit", createAppName)
+	}
 	// --server is the root's persistent flag; read it directly so a profile
 	// or CONDUCTOR_SERVER_URL never stands in for an explicit choice.
 	serverInput, _ := cmd.Flags().GetString("server")
@@ -300,6 +313,7 @@ func runLogin(cmd *cobra.Command, _ []string) error {
 
 	q := neturl.Values{}
 	q.Set("setup", "cli")
+	q.Set("app", createAppName)
 	q.Set("port", fmt.Sprint(port))
 	q.Set("state", state)
 	if loginLaunchpad != "" {
@@ -307,7 +321,7 @@ func runLogin(cmd *cobra.Command, _ []string) error {
 	}
 	approveURL := target.UIOrigin + "/?" + q.Encode()
 
-	fmt.Printf("Signing in to %s (profile %q).\n", target.UIOrigin, profileName)
+	fmt.Printf("Creating an access key for application %q on %s (profile %q).\n", createAppName, target.UIOrigin, profileName)
 	if loginNoBrowser {
 		fmt.Printf("Open this link in a browser on this computer:\n  %s\n", approveURL)
 	} else {
@@ -350,21 +364,22 @@ func runLogin(cmd *cobra.Command, _ []string) error {
 
 	app := res.AppName
 	if app == "" {
-		app = "your application"
+		app = createAppName
 	}
 	fmt.Printf("✓ Logged in to %s as %s (key %s).\n", target.UIOrigin, app, res.KeyID)
 	fmt.Printf("✓ Saved profile %q: %s\n", profileName, path)
 	fmt.Printf("\nUse it:            conductor --profile %s workflow list\n", profileName)
-	fmt.Println("Add another server: conductor login --server <url>")
+	fmt.Println("Add another server: conductor create-app --server <url>")
 	return nil
 }
 
 func init() {
-	loginCmd.Flags().BoolVar(&loginNoBrowser, "no-browser", false, "print the link instead of opening a browser")
-	loginCmd.Flags().DurationVar(&loginTimeout, "timeout", 5*time.Minute, "how long to wait for approval in the browser")
+	createAppCmd.Flags().StringVar(&createAppName, "name", defaultAppName, "application to create or reuse (letters, digits, space, _ . -)")
+	createAppCmd.Flags().BoolVar(&loginNoBrowser, "no-browser", false, "print the link instead of opening a browser")
+	createAppCmd.Flags().DurationVar(&loginTimeout, "timeout", 5*time.Minute, "how long to wait for approval in the browser")
 	// Loads a Launch Pad PR preview bundle (?launchpad=<url>) until the
 	// approval page ships in the published bundle.
-	loginCmd.Flags().StringVar(&loginLaunchpad, "launchpad", "", "Launch Pad bundle URL to load (testing)")
-	loginCmd.Flags().MarkHidden("launchpad")
-	rootCmd.AddCommand(loginCmd)
+	createAppCmd.Flags().StringVar(&loginLaunchpad, "launchpad", "", "Launch Pad bundle URL to load (testing)")
+	createAppCmd.Flags().MarkHidden("launchpad")
+	rootCmd.AddCommand(createAppCmd)
 }

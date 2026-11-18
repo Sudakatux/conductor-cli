@@ -129,3 +129,29 @@ func TestLoginCallback(t *testing.T) {
 		}
 	})
 }
+
+func TestValidAppName(t *testing.T) {
+	for _, ok := range []string{"default_app", "coding-agent", "Billing Agent 2", "a", "x.y-z_1"} {
+		if !validAppName(ok) {
+			t.Errorf("%q should be valid", ok)
+		}
+	}
+	for _, bad := range []string{"", " lead", "-dash", "a/b", "a&b", "a?b", strings.Repeat("a", 65), "tab\tname"} {
+		if validAppName(bad) {
+			t.Errorf("%q should be invalid", bad)
+		}
+	}
+}
+
+func TestCreateAppCommandShape(t *testing.T) {
+	if createAppCmd.Use != "create-app" {
+		t.Fatalf("Use = %q", createAppCmd.Use)
+	}
+	f := createAppCmd.Flags().Lookup("name")
+	if f == nil || f.DefValue != defaultAppName || defaultAppName != "default_app" {
+		t.Fatalf("--name flag default: %+v", f)
+	}
+	if !localOnlyCommands["create-app"] || localOnlyCommands["login"] {
+		t.Fatal("create-app must be local-only and login gone")
+	}
+}
