@@ -666,9 +666,6 @@ func runIntegrationAdd(p *prompter, itype string) error {
 		fmt.Fprintf(p.out, ", \"model\": %q", added[0])
 	}
 	fmt.Fprintln(p.out)
-	if integrationShareWith == "" {
-		fmt.Fprintln(p.out, "Only this application can see it until it's shared (--share-with <user>, or Access Control in the UI).")
-	}
 	return nil
 }
 
