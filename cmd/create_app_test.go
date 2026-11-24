@@ -14,11 +14,20 @@
 package cmd
 
 import (
+	"bytes"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestResolveLoginTarget(t *testing.T) {
@@ -73,28 +82,29 @@ func TestLoginCallback(t *testing.T) {
 	const ui = "https://acme.orkesconductor.com"
 	good := neturl.Values{"state": {"s3cr3t-state"}, "keyId": {"k1"}, "secret": {"v1"}, "appName": {"coding-agent"}}
 
-	t.Run("wrong state is rejected", func(t *testing.T) {
-		results := make(chan loginResult, 1)
-		h := loginCallbackHandler("s3cr3t-state", ui, results)
+	t.Run("wrong state is rejected and counted", func(t *testing.T) {
+		h := loginCallbackHandler("s3cr3t-state", ui)
 		bad := neturl.Values{"state": {"nope"}, "keyId": {"k"}, "secret": {"s"}}
 		if rec := postCallback(h, ui, bad); rec.Code != http.StatusForbidden {
 			t.Fatalf("got %d", rec.Code)
 		}
-		if len(results) != 0 {
+		if len(h.results) != 0 {
 			t.Fatal("no result should be delivered")
+		}
+		if n := h.wrongStateCount(); n != 1 {
+			t.Fatalf("wrong state count = %d", n)
 		}
 	})
 
 	t.Run("another site's origin is rejected", func(t *testing.T) {
-		results := make(chan loginResult, 1)
-		h := loginCallbackHandler("s3cr3t-state", ui, results)
+		h := loginCallbackHandler("s3cr3t-state", ui)
 		if rec := postCallback(h, "https://evil.example", good); rec.Code != http.StatusForbidden {
 			t.Fatalf("got %d", rec.Code)
 		}
 	})
 
 	t.Run("GET is rejected", func(t *testing.T) {
-		h := loginCallbackHandler("s3cr3t-state", ui, make(chan loginResult, 1))
+		h := loginCallbackHandler("s3cr3t-state", ui)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, loginCallbackPath, nil))
 		if rec.Code != http.StatusMethodNotAllowed {
@@ -104,30 +114,270 @@ func TestLoginCallback(t *testing.T) {
 
 	// https -> http://127.0.0.1 is a downgrade: browsers send Origin: null.
 	for _, origin := range []string{"null", "", ui} {
-		t.Run("origin "+origin+" delivers once", func(t *testing.T) {
-			results := make(chan loginResult, 1)
-			h := loginCallbackHandler("s3cr3t-state", ui, results)
-			if rec := postCallback(h, origin, good); rec.Code != http.StatusOK {
-				t.Fatalf("got %d", rec.Code)
-			}
-			res := <-results
+		t.Run("origin "+origin+" delivers once and waits for the outcome", func(t *testing.T) {
+			h := loginCallbackHandler("s3cr3t-state", ui)
+			done := make(chan *httptest.ResponseRecorder)
+			go func() { done <- postCallback(h, origin, good) }()
+			res := <-h.results
 			if res.KeyID != "k1" || res.Secret != "v1" || res.AppName != "coding-agent" {
 				t.Fatalf("got %+v", res)
 			}
-			if rec := postCallback(h, origin, good); rec.Code != http.StatusNotFound {
+			res.finish(loginOutcome{http.StatusOK, "You're connected", "ok"})
+			if rec := <-done; rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "connected") {
+				t.Fatalf("got %d %s", rec.Code, rec.Body)
+			}
+			if rec := postCallback(h, origin, good); rec.Code != http.StatusConflict {
 				t.Fatalf("second delivery: got %d", rec.Code)
 			}
 		})
 	}
 
-	t.Run("denied is reported", func(t *testing.T) {
-		results := make(chan loginResult, 1)
-		h := loginCallbackHandler("s3cr3t-state", ui, results)
-		postCallback(h, "null", neturl.Values{"state": {"s3cr3t-state"}, "error": {"denied"}})
-		if res := <-results; res.Err != "denied" {
-			t.Fatalf("got %+v", res)
+	t.Run("a rejected key is shown in the browser, not success", func(t *testing.T) {
+		h := loginCallbackHandler("s3cr3t-state", ui)
+		done := make(chan *httptest.ResponseRecorder)
+		go func() { done <- postCallback(h, "null", good) }()
+		res := <-h.results
+		res.finish(loginOutcome{http.StatusBadGateway, "Not connected", "rejected"})
+		rec := <-done
+		if rec.Code != http.StatusBadGateway || strings.Contains(rec.Body.String(), "You&#39;re connected") {
+			t.Fatalf("got %d %s", rec.Code, rec.Body)
 		}
 	})
+
+	t.Run("the browser is not held past the reply wait", func(t *testing.T) {
+		h := loginCallbackHandler("s3cr3t-state", ui)
+		h.replyWait = 20 * time.Millisecond
+		rec := postCallback(h, "null", good) // nobody calls finish
+		if rec.Code != http.StatusAccepted || strings.Contains(rec.Body.String(), "connected") {
+			t.Fatalf("got %d %s", rec.Code, rec.Body)
+		}
+		res := <-h.results
+		res.finish(loginOutcome{}) // a late finish must not block
+	})
+
+	t.Run("denied is reported", func(t *testing.T) {
+		h := loginCallbackHandler("s3cr3t-state", ui)
+		postCallback(h, "null", neturl.Values{"state": {"s3cr3t-state"}, "error": {"denied"}})
+		res := <-h.results
+		if res.Err != "denied" {
+			t.Fatalf("got %+v", res)
+		}
+		if got := browserError(res).Error(); got != "create-app failed (denied): access was denied in the browser" {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("a failure in the page is reported with its description", func(t *testing.T) {
+		h := loginCallbackHandler("s3cr3t-state", ui)
+		postCallback(h, "null", neturl.Values{"state": {"s3cr3t-state"}, "error": {"key_creation_failed"},
+			"error_description": {"403 Forbidden\nnot allowed"}})
+		got := browserError(<-h.results).Error()
+		want := `create-app failed (approval_failed): the browser reported "key_creation_failed": 403 Forbidden not allowed`
+		if got != want {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("the right state but no key ends the wait", func(t *testing.T) {
+		h := loginCallbackHandler("s3cr3t-state", ui)
+		if rec := postCallback(h, "null", neturl.Values{"state": {"s3cr3t-state"}}); rec.Code != http.StatusBadRequest {
+			t.Fatalf("got %d", rec.Code)
+		}
+		if got := browserError(<-h.results).Error(); !strings.HasPrefix(got, "create-app failed (missing_key): ") {
+			t.Fatalf("got %q", got)
+		}
+	})
+}
+
+// Two approvals racing (a double-clicked Approve): exactly one is delivered,
+// the other is told so at once, and nothing blocks. Run with -race.
+func TestLoginCallbackConcurrentDoublePost(t *testing.T) {
+	const ui = "https://acme.orkesconductor.com"
+	good := neturl.Values{"state": {"s3cr3t-state"}, "keyId": {"k1"}, "secret": {"v1"}}
+	for i := 0; i < 50; i++ {
+		h := loginCallbackHandler("s3cr3t-state", ui)
+		var wg sync.WaitGroup
+		codes := make(chan int, 2)
+		for j := 0; j < 2; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				codes <- postCallback(h, "null", good).Code
+			}()
+		}
+		select {
+		case res := <-h.results:
+			res.finish(loginOutcome{http.StatusOK, "You're connected", ""})
+		case <-time.After(5 * time.Second):
+			t.Fatal("no delivery")
+		}
+		finished := make(chan struct{})
+		go func() { wg.Wait(); close(finished) }()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a callback request hung")
+		}
+		close(codes)
+		got := map[int]int{}
+		for c := range codes {
+			got[c]++
+		}
+		if got[http.StatusOK] != 1 || got[http.StatusConflict] != 1 {
+			t.Fatalf("codes = %v", got)
+		}
+		if len(h.results) != 0 {
+			t.Fatal("a second result leaked into the channel")
+		}
+	}
+}
+
+// The login server shuts down promptly even with a request still held open.
+func TestShutdownLoginServerNeverHangs(t *testing.T) {
+	h := loginCallbackHandler("s3cr3t-state", "https://x")
+	h.replyWait = time.Hour
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: h}
+	go srv.Serve(ln)
+	go http.PostForm("http://"+ln.Addr().String()+loginCallbackPath,
+		neturl.Values{"state": {"s3cr3t-state"}, "keyId": {"k"}, "secret": {"s"}})
+	<-h.results // delivered; nobody ever calls finish
+	done := make(chan struct{})
+	go func() { shutdownLoginServer(srv); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown hung")
+	}
+}
+
+func withLoginKeyCheck(t *testing.T, f func(apiURL, keyID, secret string) error) {
+	old := checkLoginKey
+	checkLoginKey = f
+	t.Cleanup(func() { checkLoginKey = old })
+}
+
+func TestSaveVerifiedProfileRejectedKeyKeepsExistingProfile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config-acme.yaml")
+	original := []byte("server: https://acme.orkesconductor.com/api\nauth-key: old\nauth-secret: old-secret\n# hand edited\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	withLoginKeyCheck(t, func(string, string, string) error { return errors.New("{\"message\": \"bad\"}\n") })
+
+	_, err := saveVerifiedProfile(dir, "acme", "https://acme.orkesconductor.com/api", "k2", "bad")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	msg := err.Error()
+	if !strings.HasPrefix(msg, "create-app failed (key_rejected): ") || !strings.Contains(msg, `the existing profile "acme" was kept unchanged`) {
+		t.Fatalf("got %q", msg)
+	}
+	if strings.Contains(msg, "\n") {
+		t.Fatalf("error must be one line: %q", msg)
+	}
+	got, _ := os.ReadFile(path)
+	if !bytes.Equal(got, original) {
+		t.Fatalf("profile changed:\n%s", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("leftover files: %v", entries)
+	}
+}
+
+func TestSaveVerifiedProfileRejectedKeyWithoutProfile(t *testing.T) {
+	dir := t.TempDir()
+	withLoginKeyCheck(t, func(string, string, string) error { return errors.New("401") })
+	_, err := saveVerifiedProfile(dir, "acme", "https://a/api", "k", "s")
+	if err == nil || !strings.Contains(err.Error(), "no profile was saved") {
+		t.Fatalf("got %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("files written: %v", entries)
+	}
+}
+
+func TestSaveVerifiedProfileReplacesAtomically0600(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config-acme.yaml")
+	if err := os.WriteFile(path, []byte("auth-secret: old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	checked := false
+	withLoginKeyCheck(t, func(api, id, secret string) error {
+		checked = true
+		if api != "https://a/api" || id != "k" || secret != "s" {
+			t.Errorf("checked %s %s %s", api, id, secret)
+		}
+		return nil
+	})
+	got, err := saveVerifiedProfile(dir, "acme", "https://a/api", "k", "s")
+	if err != nil || got != path || !checked {
+		t.Fatalf("got %q %v checked=%v", got, err, checked)
+	}
+	fi, _ := os.Stat(path)
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0600 {
+		t.Fatalf("mode %v", fi.Mode().Perm())
+	}
+	data, _ := os.ReadFile(path)
+	for _, want := range []string{"server: https://a/api", "server-type: Enterprise", "auth-key: k", "auth-secret: s"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("missing %q in\n%s", want, data)
+		}
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("leftover files: %v", entries)
+	}
+}
+
+// The real check posts the key to <api>/token.
+func TestCheckLoginKeyAgainstServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case r.URL.Path == "/text/token":
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte("hello"))
+		case r.URL.Path == "/empty/token":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{}`))
+		case r.URL.Path != "/api/token" || !strings.Contains(string(body), `"keySecret":"good"`):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"message":"bad key"}`))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"token":"t"}`))
+		}
+	}))
+	defer srv.Close()
+	if err := checkLoginKey(srv.URL+"/api", "k", "good"); err != nil {
+		t.Fatalf("good key: %v", err)
+	}
+	if err := checkLoginKey(srv.URL+"/api", "k", "bad"); err == nil {
+		t.Fatal("bad key accepted")
+	}
+	// Not the API: no panic, no false success.
+	if err := checkLoginKey(srv.URL+"/text", "k", "good"); err == nil {
+		t.Fatal("text/plain response accepted")
+	}
+	if err := checkLoginKey(srv.URL+"/empty", "k", "good"); err == nil {
+		t.Fatal("empty token accepted")
+	}
+}
+
+func TestCreateAppErrorFormat(t *testing.T) {
+	e := &createAppError{Code: "timeout", Detail: "no answer from the browser after 5m0s", Hint: "hint"}
+	if got := e.Error(); got != "create-app failed (timeout): no answer from the browser after 5m0s\nhint" {
+		t.Fatalf("got %q", got)
+	}
+	if got := oneLine("a\n  b\tc"); got != "a b c" {
+		t.Fatalf("got %q", got)
+	}
 }
 
 func TestValidAppName(t *testing.T) {
@@ -153,5 +403,9 @@ func TestCreateAppCommandShape(t *testing.T) {
 	}
 	if !localOnlyCommands["create-app"] || localOnlyCommands["login"] {
 		t.Fatal("create-app must be local-only and login gone")
+	}
+	// create-app's failures are one line; other commands keep their usage.
+	if !createAppCmd.SilenceUsage || rootCmd.SilenceUsage || workflowCmd.SilenceUsage {
+		t.Fatal("SilenceUsage must be set on create-app only")
 	}
 }

@@ -19,7 +19,6 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"html"
 	"net"
@@ -27,9 +26,13 @@ import (
 	neturl "net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/conductor-oss/conductor-cli/internal/cliconfig"
@@ -83,7 +86,9 @@ acme.orkesconductor.com).`,
   conductor --profile prod workflow list`,
 	GroupID: "config",
 	Args:    cobra.NoArgs,
-	RunE:    runCreateApp,
+	// Failures are one "create-app failed (<code>): …" line; usage would bury it.
+	SilenceUsage: true,
+	RunE:         runCreateApp,
 }
 
 const defaultAppName = "default_app"
@@ -145,63 +150,185 @@ func newLoginState() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// loginResult is what the browser hands back: a key, or an error such as
-// "denied".
-type loginResult struct {
-	KeyID   string
-	Secret  string
-	AppName string
-	Err     string
+// createAppError is how every create-app failure is reported: one stable first
+// line, "create-app failed (<code>): <detail>", optionally followed by hint
+// lines. Skills and agents match on the code.
+type createAppError struct {
+	Code   string
+	Detail string
+	Hint   string
 }
 
-// loginCallbackHandler accepts exactly one POST carrying the expected state.
+func (e *createAppError) Error() string {
+	s := fmt.Sprintf("create-app failed (%s): %s", e.Code, e.Detail)
+	if e.Hint != "" {
+		s += "\n" + e.Hint
+	}
+	return s
+}
+
+func createAppFail(code, format string, a ...interface{}) error {
+	return &createAppError{Code: code, Detail: fmt.Sprintf(format, a...)}
+}
+
+// oneLine flattens text from the browser or a server so it can't break the
+// single error line, and caps its length.
+func oneLine(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 200 {
+		s = s[:200] + "…"
+	}
+	return s
+}
+
+// loginOutcome is what the CLI tells the browser after it has checked and
+// saved the key. The callback holds its response open until it arrives.
+type loginOutcome struct {
+	status      int
+	title, body string
+}
+
+// loginResult is what the browser hands back: a key, or an error code such as
+// "denied" (with an optional description).
+type loginResult struct {
+	KeyID     string
+	Secret    string
+	AppName   string
+	Err       string
+	ErrDetail string
+	reply     chan loginOutcome
+}
+
+// finish answers the browser's waiting request. It never blocks: the request
+// may already have given up.
+func (r loginResult) finish(o loginOutcome) {
+	if r.reply == nil {
+		return
+	}
+	select {
+	case r.reply <- o:
+	default:
+	}
+}
+
+// loginReplyWait bounds how long the browser's request is held open while the
+// CLI checks the key. Past it the page says to look at the terminal.
+var loginReplyWait = 45 * time.Second
+
+// loginCallback accepts exactly one POST carrying the expected state.
 // Origin is not trusted: an https page posting to http://127.0.0.1 is a
 // downgrade, so browsers send "Origin: null" under strict-origin referrer
 // policies. Only a present, non-null, different origin is rejected.
-func loginCallbackHandler(state, uiOrigin string, results chan<- loginResult) http.Handler {
-	delivered := false
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != loginCallbackPath || delivered {
-			writeLoginPage(w, http.StatusNotFound, "Not found", "")
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeLoginPage(w, http.StatusMethodNotAllowed, "Method not allowed", "")
-			return
-		}
-		if origin := r.Header.Get("Origin"); origin != "" && origin != "null" && origin != uiOrigin {
-			writeLoginPage(w, http.StatusForbidden, "Wrong origin", "This request did not come from "+uiOrigin+".")
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, loginMaxBody)
-		if err := r.ParseForm(); err != nil {
-			writeLoginPage(w, http.StatusBadRequest, "Bad request", "")
-			return
-		}
-		got := r.PostForm.Get("state")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(state)) != 1 {
-			writeLoginPage(w, http.StatusForbidden, "Wrong sign-in link", "This link was not opened by this CLI. Run conductor create-app again.")
-			return
-		}
-		if e := r.PostForm.Get("error"); e != "" {
-			delivered = true
+//
+// A wrong state is answered 403 and otherwise ignored, so an unrelated page
+// can't end the wait; it is counted and named if the wait times out.
+type loginCallback struct {
+	state, uiOrigin string
+	results         chan loginResult
+	replyWait       time.Duration
+
+	mu         sync.Mutex
+	delivered  bool
+	wrongState int
+}
+
+func loginCallbackHandler(state, uiOrigin string) *loginCallback {
+	return &loginCallback{state: state, uiOrigin: uiOrigin, results: make(chan loginResult, 1), replyWait: loginReplyWait}
+}
+
+func (c *loginCallback) wrongStateCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wrongState
+}
+
+// claim marks the one delivery. Only the first caller gets true.
+func (c *loginCallback) claim() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.delivered {
+		return false
+	}
+	c.delivered = true
+	return true
+}
+
+// deliver hands res to the CLI without blocking; the channel has room for the
+// one delivery claim() allows.
+func (c *loginCallback) deliver(res loginResult) bool {
+	select {
+	case c.results <- res:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *loginCallback) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != loginCallbackPath {
+		writeLoginPage(w, http.StatusNotFound, "Not found", "")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeLoginPage(w, http.StatusMethodNotAllowed, "Method not allowed", "")
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && origin != "null" && origin != c.uiOrigin {
+		writeLoginPage(w, http.StatusForbidden, "Wrong origin", "This request did not come from "+c.uiOrigin+".")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, loginMaxBody)
+	if err := r.ParseForm(); err != nil {
+		writeLoginPage(w, http.StatusBadRequest, "Bad request", "")
+		return
+	}
+	got := r.PostForm.Get("state")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(c.state)) != 1 {
+		c.mu.Lock()
+		c.wrongState++
+		c.mu.Unlock()
+		writeLoginPage(w, http.StatusForbidden, "Wrong sign-in link", "This link was not opened by this CLI. Run conductor create-app again.")
+		return
+	}
+	if !c.claim() {
+		writeLoginPage(w, http.StatusConflict, "Already answered", "The CLI already got an answer from this page. Check your terminal.")
+		return
+	}
+
+	if e := r.PostForm.Get("error"); e != "" {
+		c.deliver(loginResult{Err: oneLine(e), ErrDetail: oneLine(r.PostForm.Get("error_description"))})
+		if e == "denied" {
 			writeLoginPage(w, http.StatusOK, "Cancelled", "The CLI did not get access. You can close this tab.")
-			results <- loginResult{Err: e}
-			return
+		} else {
+			writeLoginPage(w, http.StatusOK, "Not connected", "The CLI was told the key could not be created. Check your terminal.")
 		}
-		res := loginResult{
-			KeyID:   r.PostForm.Get("keyId"),
-			Secret:  r.PostForm.Get("secret"),
-			AppName: r.PostForm.Get("appName"),
-		}
-		if res.KeyID == "" || res.Secret == "" {
-			writeLoginPage(w, http.StatusBadRequest, "Missing key", "")
-			return
-		}
-		delivered = true
-		writeLoginPage(w, http.StatusOK, "You're connected", "The Conductor CLI is signed in. You can close this tab and go back to your terminal.")
-		results <- res
-	})
+		return
+	}
+	res := loginResult{
+		KeyID:   r.PostForm.Get("keyId"),
+		Secret:  r.PostForm.Get("secret"),
+		AppName: r.PostForm.Get("appName"),
+	}
+	if res.KeyID == "" || res.Secret == "" {
+		c.deliver(loginResult{Err: "missing_key"})
+		writeLoginPage(w, http.StatusBadRequest, "Missing key", "The page sent no key. The CLI stopped; check your terminal.")
+		return
+	}
+	reply := make(chan loginOutcome, 1)
+	res.reply = reply
+	if !c.deliver(res) {
+		writeLoginPage(w, http.StatusServiceUnavailable, "Not delivered", "The CLI is no longer waiting. Check your terminal.")
+		return
+	}
+	// Hold the response until the CLI has checked and saved the key, so the
+	// page never says "connected" for a key the server rejected.
+	select {
+	case o := <-reply:
+		writeLoginPage(w, o.status, o.title, o.body)
+	case <-time.After(c.replyWait):
+		writeLoginPage(w, http.StatusAccepted, "Check your terminal", "The CLI got the key and is still checking it. Your terminal shows the result.")
+	case <-r.Context().Done():
+	}
 }
 
 func writeLoginPage(w http.ResponseWriter, status int, title, body string) {
@@ -213,29 +340,99 @@ func writeLoginPage(w http.ResponseWriter, status int, title, body string) {
 <h2>%s</h2><p>%s</p></body>`, html.EscapeString(title), html.EscapeString(title), html.EscapeString(body))
 }
 
-// writeLoginProfile saves an Enterprise key + secret profile, 0600.
-func writeLoginProfile(profileName, apiURL, keyID, keySecret string) (string, error) {
-	dir, err := cliconfig.Dir()
+// browserError turns an error the page posted into the CLI's failure.
+func browserError(res loginResult) error {
+	switch res.Err {
+	case "denied":
+		return createAppFail("denied", "access was denied in the browser")
+	case "missing_key":
+		return createAppFail("missing_key", "the browser answered without a key")
+	}
+	detail := "the browser reported " + strconv.Quote(res.Err)
+	if res.ErrDetail != "" {
+		detail += ": " + res.ErrDetail
+	}
+	return createAppFail("approval_failed", "%s", detail)
+}
+
+// checkLoginKey exchanges the key for a token at <api>/token. A var so tests
+// can stand in for the server.
+var checkLoginKey = func(apiURL, keyID, secret string) (err error) {
+	// The SDK panics decoding a 2xx text/plain body (reflect SetString on a
+	// struct), e.g. when --server points at something that isn't the API.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("unexpected response from %s/token", apiURL)
+		}
+	}()
+	token, _, err := authentication.GetToken(
+		*settings.NewAuthenticationSettings(keyID, secret),
+		settings.NewHttpSettings(apiURL),
+		&http.Client{Timeout: 30 * time.Second},
+	)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", err
+	if token.Token == "" {
+		return fmt.Errorf("%s/token returned no token", apiURL)
 	}
+	return nil
+}
+
+// saveVerifiedProfile checks the key first and only then replaces the profile,
+// atomically (temp file in the same directory, 0600, renamed over it). On any
+// failure an existing profile is left exactly as it was.
+func saveVerifiedProfile(dir, profileName, apiURL, keyID, keySecret string) (string, error) {
 	path := cliconfig.Resolve(dir, profileName)
-	data, err := yaml.Marshal(map[string]string{
+	kept := "no profile was saved"
+	if _, err := os.Stat(path); err == nil {
+		kept = fmt.Sprintf("the existing profile %q was kept unchanged", profileName)
+	}
+	if err := checkLoginKey(apiURL, keyID, keySecret); err != nil {
+		return "", createAppFail("key_rejected", "the server rejected the new key %s at %s/token: %s; %s",
+			keyID, apiURL, oneLine(err.Error()), kept)
+	}
+	if err := writeProfileAtomic(dir, path, map[string]string{
 		"server":      apiURL,
 		"server-type": "Enterprise",
 		"auth-key":    keyID,
 		"auth-secret": keySecret,
-	})
-	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return "", err
+	}); err != nil {
+		return "", createAppFail("save_failed", "could not write %s: %s; %s", path, oneLine(err.Error()), kept)
 	}
 	return path, nil
+}
+
+func writeProfileAtomic(dir, path string, values map[string]string) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(values)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".create-app-*.yaml")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op once renamed
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func openBrowser(target string) error {
@@ -255,7 +452,7 @@ func stdinIsTerminal() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
 
 func runCreateApp(cmd *cobra.Command, _ []string) error {
 	if !validAppName(createAppName) {
-		return fmt.Errorf("invalid --name %q: use 1-64 letters, digits, spaces, _ . or -, starting with a letter or digit", createAppName)
+		return createAppFail("invalid_name", "invalid --name %q: use 1-64 letters, digits, spaces, _ . or -, starting with a letter or digit", createAppName)
 	}
 	// --server is the root's persistent flag; read it directly so a profile
 	// or CONDUCTOR_SERVER_URL never stands in for an explicit choice.
@@ -273,7 +470,7 @@ func runCreateApp(cmd *cobra.Command, _ []string) error {
 	}
 	target, err := resolveLoginTarget(serverInput)
 	if err != nil {
-		return err
+		return createAppFail("invalid_server", "%s", err.Error())
 	}
 
 	profileName := profile
@@ -282,34 +479,37 @@ func runCreateApp(cmd *cobra.Command, _ []string) error {
 	}
 	dir, err := cliconfig.Dir()
 	if err != nil {
-		return err
+		return createAppFail("save_failed", "%s", err.Error())
 	}
 	if _, err := os.Stat(cliconfig.Resolve(dir, profileName)); err == nil && !yes {
 		if !stdinIsTerminal() {
-			return fmt.Errorf("profile %q already exists; pass --yes to replace it or --profile to pick another name", profileName)
+			return createAppFail("profile_exists", "profile %q already exists; pass --yes to replace it or --profile to pick another name", profileName)
 		}
 		if !confirm(fmt.Sprintf("Profile %q already exists. Replace it?", profileName)) {
-			return errors.New("cancelled")
+			return createAppFail("cancelled", "kept the existing profile %q", profileName)
 		}
 	}
 
 	state, err := newLoginState()
 	if err != nil {
-		return err
+		return createAppFail("listen_failed", "%s", err.Error())
 	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return fmt.Errorf("could not listen on 127.0.0.1: %w", err)
+		return createAppFail("listen_failed", "could not listen on 127.0.0.1: %s", err.Error())
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	results := make(chan loginResult, 1)
+	callback := loginCallbackHandler(state, target.UIOrigin)
 	srv := &http.Server{
-		Handler:           loginCallbackHandler(state, target.UIOrigin, results),
+		Handler:           callback,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go srv.Serve(ln)
-	defer srv.Shutdown(context.Background())
+	defer shutdownLoginServer(srv)
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	q := neturl.Values{}
 	q.Set("setup", "cli")
@@ -334,33 +534,32 @@ func runCreateApp(cmd *cobra.Command, _ []string) error {
 
 	var res loginResult
 	select {
-	case res = <-results:
+	case res = <-callback.results:
 	case <-time.After(loginTimeout):
-		return fmt.Errorf("no answer from the browser after %s.\n"+
+		detail := fmt.Sprintf("no answer from the browser after %s", loginTimeout)
+		if n := callback.wrongStateCount(); n > 0 {
+			detail += fmt.Sprintf(" (%d callback(s) with the wrong state were ignored)", n)
+		}
+		return &createAppError{Code: "timeout", Detail: detail, Hint: fmt.Sprintf(
 			"Is the browser on another computer? Open %s/?setup=key there, then run\n"+
-			"  conductor config save --profile %s\n"+
-			"and enter %s, Enterprise, and the key id and secret it shows",
-			loginTimeout, target.UIOrigin, profileName, target.APIURL)
-	case <-cmd.Context().Done():
-		return cmd.Context().Err()
+				"  conductor config save --profile %s\n"+
+				"and enter %s, Enterprise, and the key id and secret it shows",
+			target.UIOrigin, profileName, target.APIURL)}
+	case <-ctx.Done():
+		return createAppFail("interrupted", "stopped before the browser answered")
 	}
 	if res.Err != "" {
-		return fmt.Errorf("not signed in: %s in the browser", res.Err)
+		return browserError(res)
 	}
 
-	path, err := writeLoginProfile(profileName, target.APIURL, res.KeyID, res.Secret)
+	path, err := saveVerifiedProfile(dir, profileName, target.APIURL, res.KeyID, res.Secret)
 	if err != nil {
-		return fmt.Errorf("could not save profile: %w", err)
+		res.finish(loginOutcome{http.StatusBadGateway, "Not connected",
+			"The server rejected the new key or the CLI could not save it. Check your terminal."})
+		return err
 	}
-
-	// Prove the key works before claiming success. The token is not printed.
-	if _, _, err := authentication.GetToken(
-		*settings.NewAuthenticationSettings(res.KeyID, res.Secret),
-		settings.NewHttpSettings(target.APIURL),
-		http.DefaultClient,
-	); err != nil {
-		return fmt.Errorf("saved %s, but the new key was rejected: %v", path, err)
-	}
+	res.finish(loginOutcome{http.StatusOK, "You're connected",
+		"The Conductor CLI saved the key. You can close this tab and go back to your terminal."})
 
 	app := res.AppName
 	if app == "" {
@@ -371,6 +570,16 @@ func runCreateApp(cmd *cobra.Command, _ []string) error {
 	fmt.Printf("\nUse it:            conductor --profile %s workflow list\n", profileName)
 	fmt.Println("Add another server: conductor create-app --server <url>")
 	return nil
+}
+
+// shutdownLoginServer gives an in-flight reply a moment to reach the browser,
+// then closes everything. It never waits longer than that.
+func shutdownLoginServer(srv *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		srv.Close()
+	}
 }
 
 func init() {
