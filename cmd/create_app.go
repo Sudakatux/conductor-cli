@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"html"
+	"io"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -67,6 +68,11 @@ The CLI listens on 127.0.0.1 for one request, opens the server's Launch Pad,
 and waits. After you sign in and click Approve, the page finds or creates the
 application (--name, default "default_app"), creates an access key for it and
 hands it to the CLI, which saves ~/.conductor-cli/config-<profile>.yaml.
+
+It works only on Orkes Developer Edition. Before anything else it reads
+<server>/context.js and stops with "create-app failed (no_launchpad)" unless
+PLAYGROUND is true there. On other servers, create a key under Access Control
+-> Applications and run 'conductor config save'.
 
 The browser and the CLI must run on the same computer. Otherwise (SSH, a
 container), open the printed fallback link and use 'conductor config save'.
@@ -435,7 +441,9 @@ func writeProfileAtomic(dir, path string, values map[string]string) error {
 	return os.Rename(tmpName, path)
 }
 
-func openBrowser(target string) error {
+// openBrowser and loginListen are vars so tests can see whether create-app
+// got as far as opening a browser or a listener.
+var openBrowser = func(target string) error {
 	var c *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
@@ -446,6 +454,52 @@ func openBrowser(target string) error {
 		c = exec.Command("xdg-open", target)
 	}
 	return c.Start()
+}
+
+var loginListen = net.Listen
+
+// noLaunchpadDetail is the stable detail of the no_launchpad failure.
+const noLaunchpadDetail = "create-app is only available on Orkes Developer Edition (developer.orkescloud.com)"
+
+// developerEditionTimeout bounds the context.js fetch.
+var developerEditionTimeout = 5 * time.Second
+
+// playgroundPattern finds the PLAYGROUND setting in context.js, which is
+// JavaScript, not JSON: the key may be quoted or bare, the value a boolean or
+// a string.
+var playgroundPattern = regexp.MustCompile(`(?:^|[^\w$])["']?PLAYGROUND["']?\s*:\s*["']?([\w$]*)`)
+
+// checkDeveloperEdition reads <UI origin>/context.js and fails with
+// no_launchpad unless PLAYGROUND is true. Only Developer Edition mounts the
+// Launch Pad that approves the key; anywhere else the browser would land on a
+// page that can't answer. There is deliberately no override.
+func checkDeveloperEdition(uiOrigin string) error {
+	unconfirmed := func(format string, a ...interface{}) error {
+		return createAppFail("no_launchpad", "%s; couldn't confirm this is Developer Edition: %s",
+			noLaunchpadDetail, oneLine(fmt.Sprintf(format, a...)))
+	}
+	contextURL := uiOrigin + "/context.js"
+	client := &http.Client{Timeout: developerEditionTimeout}
+	resp, err := client.Get(contextURL)
+	if err != nil {
+		return unconfirmed("could not read %s: %s", contextURL, err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return unconfirmed("%s returned %s", contextURL, resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return unconfirmed("could not read %s: %s", contextURL, err.Error())
+	}
+	m := playgroundPattern.FindSubmatch(body)
+	if m == nil {
+		return unconfirmed("%s has no PLAYGROUND setting", contextURL)
+	}
+	if string(m[1]) != "true" {
+		return createAppFail("no_launchpad", "%s", noLaunchpadDetail)
+	}
+	return nil
 }
 
 func stdinIsTerminal() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
@@ -472,6 +526,11 @@ func runCreateApp(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return createAppFail("invalid_server", "%s", err.Error())
 	}
+	// Before any prompt, listener or browser: only Developer Edition can
+	// approve the key. --launchpad only picks a bundle; it doesn't skip this.
+	if err := checkDeveloperEdition(target.UIOrigin); err != nil {
+		return err
+	}
 
 	profileName := profile
 	if !cmd.Flags().Changed("profile") {
@@ -494,7 +553,7 @@ func runCreateApp(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return createAppFail("listen_failed", "%s", err.Error())
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := loginListen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return createAppFail("listen_failed", "could not listen on 127.0.0.1: %s", err.Error())
 	}
@@ -527,8 +586,11 @@ func runCreateApp(cmd *cobra.Command, _ []string) error {
 	} else {
 		if err := openBrowser(approveURL); err != nil {
 			fmt.Printf("Could not open a browser (%v).\n", err)
+			fmt.Printf("If your browser didn't open, visit:\n  %s\n", approveURL)
+		} else {
+			// Stable line: skills relay "click Approve" only after seeing it.
+			fmt.Printf("Opening %s — sign in and click Approve\n", approveURL)
 		}
-		fmt.Printf("If your browser didn't open, visit:\n  %s\n", approveURL)
 	}
 	fmt.Println("Waiting for you to approve in the browser…")
 
