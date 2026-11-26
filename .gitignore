@@ -39,3 +39,6 @@ c123.db-wal
 # Python bytecode from the E2E deploy fixture
 __pycache__/
 *.pyc
+
+# go build main.go output (a 24 MB binary was once committed)
+/main
