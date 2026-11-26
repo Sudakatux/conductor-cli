@@ -3,6 +3,7 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const platform = process.platform;
 const binaryName = platform === 'win32' ? 'conductor.exe' : 'conductor';
@@ -21,4 +22,16 @@ const result = spawnSync(binaryPath, process.argv.slice(2), {
   shell: false
 });
 
-process.exit(result.status);
+if (result.error) {
+  console.error(`Error: could not run ${binaryPath}: ${result.error.message}`);
+  process.exit(1);
+}
+
+// Killed by a signal: status is null. Exit like a shell would (128 + signal
+// number) so callers never mistake it for success.
+if (result.signal) {
+  const signum = os.constants.signals[result.signal];
+  process.exit(signum ? 128 + signum : 1);
+}
+
+process.exit(result.status ?? 1);
